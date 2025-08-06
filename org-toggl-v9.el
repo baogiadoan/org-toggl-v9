@@ -110,6 +110,7 @@
 
 (defun toggl-fetch-projects (&optional callback)
   "Fetch projects for toggl-workspace-id."
+  (interactive)
   (unless toggl-workspace-id
     (user-error "Workspace ID not set. Run `toggl-select-workspace` first."))
   (toggl-request
@@ -132,12 +133,12 @@
 
 (defun toggl-start-entry (description pid &optional callback)
   "Start a Toggl time entry."
-  (unless (and toggl-workspace-id pid)
-    (user-error "Workspace ID or project ID missing"))
+  (unless toggl-workspace-id
+    (user-error "Workspace ID missing"))
   (let ((payload `(("description" . ,description)
                    ("start" . ,(format-time-string "%FT%TZ" nil t))
                    ("duration" . -1)
-                   ("project_id" . ,pid)
+                   ,@(when pid `(("project_id" . ,pid)))
                    ("workspace_id" . ,toggl-workspace-id)
                    ("created_with" . "org-toggl-v9"))))
     (toggl-request
@@ -169,13 +170,119 @@
        (cl-function (lambda (&key error-thrown &allow-other-keys)
                       (message "Stopping entry failed: %s" error-thrown)))))))
 
-;; Org toggling
+;; Interactive project selection
+(defun toggl-select-project-for-task ()
+  "Interactively select a project and return project ID."
+  (if (not toggl-workspace-id)
+      (progn
+        (message "No workspace selected. Please select one first.")
+        (call-interactively 'toggl-select-workspace)
+        (when toggl-workspace-id
+          (toggl-select-project-for-task)))
+    ;; We have a workspace, get projects
+    (if (not toggl-projects)
+        (progn
+          (message "Fetching projects...")
+          (toggl-fetch-projects
+           (lambda (projects)
+             (toggl-select-project-for-task-with-projects projects))))
+      (toggl-select-project-for-task-with-projects toggl-projects))))
 
+(defun toggl-select-project-for-task-with-projects (projects)
+  "Select project from the available projects list."
+  (let* ((choices (append 
+                   '(("(No Project)" . nil))  ; Option for no project
+                   (mapcar (lambda (p) (cons (car p) (cdr p))) projects)))
+         (selection (completing-read "Select Toggl project: " choices nil t))
+         (project-id (assoc-default selection choices)))
+    project-id))
+
+;; Org toggling with interactive setup
 (defun org-toggl-clock-in ()
   (let* ((heading (org-get-heading t t t t))
-         (proj (org-entry-get (point) "toggl-project" t))
-         (pid (or (toggl-get-pid proj) toggl-default-project)))
-    (when pid (toggl-start-entry heading pid))))
+         (existing-proj (org-entry-get (point) "toggl-project" t))
+         (pid nil))
+    
+    (cond
+     ;; Case 1: Task already has a project property
+     (existing-proj
+      (setq pid (toggl-get-pid existing-proj))
+      (unless pid
+        (message "Project '%s' not found. Refreshing projects..." existing-proj)
+        (toggl-fetch-projects
+         (lambda (projects)
+           (setq pid (toggl-get-pid existing-proj))
+           (if pid
+               (toggl-start-entry heading pid)
+             (message "Project '%s' still not found. Please check project name." existing-proj))))))
+     
+     ;; Case 2: No project property - ask user
+     (t
+      (if (not toggl-workspace-id)
+          ;; No workspace - need to set that up first
+          (progn
+            (message "Setting up Toggl integration...")
+            (call-interactively 'toggl-select-workspace)
+            (when toggl-workspace-id
+              (org-toggl-clock-in)))  ; Retry after workspace is set
+        ;; Have workspace, get project choice
+        (if (not toggl-projects)
+            ;; Fetch projects first
+            (progn
+              (message "Fetching projects for selection...")
+              (toggl-fetch-projects
+               (lambda (projects)
+                 (let* ((choices (append 
+                                  '(("(No Project)" . nil))
+                                  projects))
+                        (selection (completing-read 
+                                   (format "Select Toggl project for '%s': " 
+                                           (substring heading 0 (min 40 (length heading))))
+                                   choices nil t))
+                        (selected-project-name (if (string= selection "(No Project)") nil selection))
+                        (selected-pid (if selected-project-name 
+                                          (assoc-default selection choices) 
+                                          nil)))
+                   ;; Save the selection as org property
+                   (when selected-project-name
+                     (org-entry-put (point) "toggl-project" selected-project-name)
+                     (message "Saved project '%s' to task properties" selected-project-name))
+                   ;; Start the timer
+                   (toggl-start-entry heading selected-pid)))))
+          ;; Have projects, show selection
+          (let* ((choices (append 
+                           '(("(No Project)" . nil))
+                           toggl-projects))
+                 (selection (completing-read 
+                            (format "Select Toggl project for '%s': " 
+                                    (substring heading 0 (min 40 (length heading))))
+                            choices nil t))
+                 (selected-project-name (if (string= selection "(No Project)") nil selection))
+                 (selected-pid (if selected-project-name 
+                                   (assoc-default selection choices) 
+                                   nil)))
+            ;; Save the selection as org property
+            (when selected-project-name
+              (org-entry-put (point) "toggl-project" selected-project-name)
+              (message "Saved project '%s' to task properties" selected-project-name))
+            ;; Start the timer
+            (toggl-start-entry heading selected-pid))))))
+    
+    ;; If we have a PID from existing project, start immediately
+    (when pid
+      (toggl-start-entry heading pid))))
+
+(defun toggl-ensure-setup ()
+  "Ensure workspace and projects are set up for Toggl integration."
+  (interactive)
+  (cond
+   ((not toggl-workspace-id)
+    (message "No workspace selected. Run M-x toggl-select-workspace"))
+   ((not toggl-projects)
+    (message "No projects loaded. Run M-x toggl-fetch-projects"))
+   (t 
+    (message "Toggl setup complete: workspace %s, %d projects" 
+             toggl-workspace-id (length toggl-projects)))))
 
 (defun org-toggl-clock-out ()
   (toggl-stop-entry))
@@ -191,5 +298,37 @@
         (add-hook 'org-clock-out-hook #'org-toggl-clock-out))
     (remove-hook 'org-clock-in-hook #'org-toggl-clock-in)
     (remove-hook 'org-clock-out-hook #'org-toggl-clock-out)))
+
+(defun org-toggl-change-project ()
+  "Change the Toggl project for the current task."
+  (interactive)
+  (unless toggl-workspace-id
+    (user-error "No workspace selected. Run M-x toggl-select-workspace first"))
+  (unless toggl-projects
+    (user-error "No projects loaded. Run M-x toggl-fetch-projects first"))
+  
+  (let* ((heading (org-get-heading t t t t))
+         (current-proj (org-entry-get (point) "toggl-project" t))
+         (choices (append '(("(No Project)" . nil) ("(Remove Project Property)" . "REMOVE")) 
+                         toggl-projects))
+         (selection (completing-read 
+                    (format "Change project for '%s'%s: " 
+                            (substring heading 0 (min 40 (length heading)))
+                            (if current-proj (format " (currently: %s)" current-proj) ""))
+                    choices nil t))
+         (selected-project-name (if (string= selection "(No Project)") nil 
+                                  (if (string= selection "(Remove Project Property)") "REMOVE"
+                                    selection))))
+    
+    (cond
+     ((string= selected-project-name "REMOVE")
+      (org-entry-delete (point) "toggl-project")
+      (message "Removed toggl-project property from task"))
+     (selected-project-name
+      (org-entry-put (point) "toggl-project" selected-project-name)
+      (message "Changed project to '%s'" selected-project-name))
+     (t
+      (org-entry-delete (point) "toggl-project")
+      (message "Set to no project")))))
 
 (provide 'org-toggl-v9)
