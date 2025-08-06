@@ -1,6 +1,6 @@
 ;;; org-toggl-v9.el — Org‑mode integration with Toggl Track API v9  -*- lexical-binding: t; -*-
 (require 'json)
-(require 'request)
+(require 'url)
 
 (defcustom toggl-auth-token ""
   "Your Toggl Track API token."
@@ -9,6 +9,12 @@
 
 (defvar toggl-workspace-id nil
   "Toggl Workspace ID — required for v9 API endpoints.")
+
+(defvar toggl-current-time-entry nil
+  "Current running time entry.")
+
+(defvar toggl-default-project nil
+  "Default project ID to use when none specified.")
 
 (defconst toggl-api-base "https://api.track.toggl.com/api/v9/"
   "Base URL for Toggl Track API v9.")
@@ -21,33 +27,58 @@
         (format "Basic %s" (base64-encode-string (concat toggl-auth-token ":api_token")))))
 
 (defun toggl-request (method endpoint &optional data success error)
-  (request (toggl-api-url endpoint)
-           :type method
-           :data (when data (json-encode data))
-           :headers (append (list (toggl-auth-header))
-                            (when data '(("Content-Type" . "application/json"))))
-           :parser #'json-read
-           :success success
-           :error error
-           :sync nil))
+  "Make HTTP request using url-retrieve instead of request package."
+  (let* ((url (toggl-api-url endpoint))
+         (url-request-method method)
+         (url-request-extra-headers
+          `(("Authorization" . ,(cdr (toggl-auth-header)))
+            ,@(when data '(("Content-Type" . "application/json")))))
+         (url-request-data (when data (json-encode data))))
+    
+    (url-retrieve 
+     url
+     (lambda (status)
+       (goto-char (point-min))
+       (if (plist-get status :error)
+           ;; Error case
+           (when error
+             (funcall error :error-thrown (plist-get status :error)))
+         ;; Success case
+         (progn
+           ;; Skip HTTP headers
+           (re-search-forward "^$" nil 'move)
+           (forward-char)
+           ;; Parse JSON response
+           (condition-case err
+               (let* ((json-response (buffer-substring-no-properties (point) (point-max)))
+                      (parsed-data (json-read-from-string json-response)))
+                 (when success
+                   (funcall success :data parsed-data)))
+             (error
+              (when error
+                (funcall error :error-thrown err))))))
+       ;; Clean up buffer
+       (kill-buffer (current-buffer)))
+     nil t)))
 
 (defvar toggl-projects nil)
 
 (defun toggl-fetch-workspaces (&optional callback)
-  "Retrieve workspaces and optionally CALL CALLBACK with the list."
+  "Retrieve workspaces from the v9 workspaces endpoint."
   (toggl-request
-   "GET" "me"
+   "GET" "workspaces"
    nil
    (cl-function
     (lambda (&key data &allow-other-keys)
-      (let ((ws (alist-get 'workspaces data)))
+      ;; Convert vector to list if needed
+      (let ((ws-list (if (vectorp data) (append data nil) data)))
         (if callback
-            (funcall callback ws)
+            (funcall callback ws-list)
           (message "Workspaces: %s"
                    (mapcar (lambda (w)
                              (cons (alist-get 'name w)
                                    (alist-get 'id w)))
-                           ws))))))
+                           ws-list))))))
    (cl-function (lambda (&key error-thrown &allow-other-keys)
                   (message "Failed to fetch workspaces: %s" error-thrown)))))
 
@@ -63,6 +94,20 @@
        (setq toggl-workspace-id (assoc-default sel choices))
        (message "Using workspace ID %s (\"%s\")" toggl-workspace-id sel)))))
 
+(defun toggl-get-default-workspace ()
+  "Get and set the default workspace ID from user profile."
+  (interactive)
+  (toggl-request
+   "GET" "me"
+   nil
+   (cl-function
+    (lambda (&key data &allow-other-keys)
+      (let ((default-ws-id (alist-get 'default_workspace_id data)))
+        (setq toggl-workspace-id default-ws-id)
+        (message "Using default workspace ID: %s" default-ws-id))))
+   (cl-function (lambda (&key error-thrown &allow-other-keys)
+                  (message "Failed to get default workspace: %s" error-thrown)))))
+
 (defun toggl-fetch-projects (&optional callback)
   "Fetch projects for toggl-workspace-id."
   (unless toggl-workspace-id
@@ -71,12 +116,14 @@
    "GET" (format "workspaces/%s/projects" toggl-workspace-id)
    nil
    (cl-function (lambda (&key data &allow-other-keys)
-                  (setq toggl-projects
-                        (mapcar (lambda (p)
-                                  (cons (alist-get 'name p) (alist-get 'id p)))
-                                data))
-                  (when callback (funcall callback toggl-projects))
-                  (message "Fetched %d projects" (length toggl-projects))))
+                  ;; Convert vector to list if needed
+                  (let ((projects-list (if (vectorp data) (append data nil) data)))
+                    (setq toggl-projects
+                          (mapcar (lambda (p)
+                                    (cons (alist-get 'name p) (alist-get 'id p)))
+                                  projects-list))
+                    (when callback (funcall callback toggl-projects))
+                    (message "Fetched %d projects" (length toggl-projects)))))
    (cl-function (lambda (&key error-thrown &allow-other-keys)
                   (message "Failed to fetch projects: %s" error-thrown)))))
 
