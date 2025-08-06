@@ -1,4 +1,4 @@
-;;; org-toggl-v9.el — Org‑mode integration with Toggl Track API v9  -*- lexical-binding: t; -*-
+;;; org-toggl-v9.el — Org‑mode integration with Toggl Track API v9  -*- lexical-binding: t; -*-
 (require 'json)
 (require 'request)
 
@@ -21,10 +21,10 @@
         (format "Basic %s" (base64-encode-string (concat toggl-auth-token ":api_token")))))
 
 (defun toggl-request (method endpoint &optional data success error)
-  (request (togg­l-api-url endpoint)
+  (request (toggl-api-url endpoint)
            :type method
            :data (when data (json-encode data))
-           :headers (append (list (togg­l-auth-header))
+           :headers (append (list (toggl-auth-header))
                             (when data '(("Content-Type" . "application/json"))))
            :parser #'json-read
            :success success
